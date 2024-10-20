@@ -7,16 +7,28 @@ import json
 import re
 import google.generativeai as genai
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os
+import logging
 
 app = Flask(__name__)
+CORS(app)  # This enables CORS for all routes
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class ErrorClassifier:
     def __init__(self, csv_file):
-        self.df = pd.read_csv(csv_file)
-        self.vectorizer = TfidfVectorizer()
-        self.tfidf_matrix = self.vectorizer.fit_transform(self.df['EventTemplate'])
-        
+        try:
+            self.df = pd.read_csv(csv_file)
+            self.vectorizer = TfidfVectorizer()
+            self.tfidf_matrix = self.vectorizer.fit_transform(self.df['EventTemplate'])
+            logger.info(f"Successfully initialized ErrorClassifier with {len(self.df)} entries")
+        except Exception as e:
+            logger.error(f"Failed to initialize ErrorClassifier: {str(e)}")
+            raise
+
     def preprocess_text(self, text):
         return text.replace('<*>', '.*')
         
@@ -40,9 +52,14 @@ class ErrorClassifier:
 
 class ErrorAnalysisSystem:
     def __init__(self, csv_file, api_key):
-        self.classifier = ErrorClassifier(csv_file)
-        genai.configure(api_key=api_key)
-        self.genai_model = genai.GenerativeModel('gemini-1.5-pro')
+        try:
+            self.classifier = ErrorClassifier(csv_file)
+            genai.configure(api_key=api_key)
+            self.genai_model = genai.GenerativeModel('gemini-1.5-pro')
+            logger.info("Successfully initialized ErrorAnalysisSystem")
+        except Exception as e:
+            logger.error(f"Failed to initialize ErrorAnalysisSystem: {str(e)}")
+            raise
 
     def generate_ai_response(self, error_message, model_output):
         prompt = f"""
@@ -97,49 +114,73 @@ class ErrorAnalysisSystem:
         Based on the input error message and model output, provide a detailed analysis in the same JSON format as the example above. Include relevant information for all fields: analysis, classification, severity, likelyCause, suggestedSolution, tips, and actionableRecommendations. Do not include any markdown formatting or code blocks in your response, just the raw JSON object.
         """
 
-        result = self.genai_model.generate_content(prompt)
-        cleaned_result = result.text.strip()
-        json_match = re.search(r'\{.*\}', cleaned_result, re.DOTALL)
-        
-        if json_match:
-            try:
+        try:
+            result = self.genai_model.generate_content(prompt)
+            cleaned_result = result.text.strip()
+            json_match = re.search(r'\{.*\}', cleaned_result, re.DOTALL)
+            
+            if json_match:
                 ai_response = json.loads(json_match.group())
+                logger.info("Successfully generated AI response")
                 return ai_response
-            except json.JSONDecodeError as e:
-                print(f'Failed to parse AI response as JSON: {e}')
-                return {"error": "Invalid JSON format from AI", "rawResponse": cleaned_result}
-        else:
-            print('No JSON object found in AI response')
-            return {"error": "No JSON object found in AI response", "rawResponse": cleaned_result}
+            else:
+                logger.warning('No JSON object found in AI response')
+                return {"error": "No JSON object found in AI response", "rawResponse": cleaned_result}
+        except json.JSONDecodeError as e:
+            logger.error(f'Failed to parse AI response as JSON: {e}')
+            return {"error": "Invalid JSON format from AI", "rawResponse": cleaned_result}
+        except Exception as e:
+            logger.error(f'Error generating AI response: {str(e)}')
+            return {"error": "Failed to generate AI response", "details": str(e)}
 
     def process_error(self, error_message):
-        top_matches = self.classifier.find_top_matches(error_message)
-        model_output = top_matches[['Level', 'Component', 'EventTemplate', 'type']].to_dict(orient='records')
-        ai_response = self.generate_ai_response(error_message, json.dumps(model_output))
-        return {
-            "errorMessage": error_message,
-            "modelClassification": model_output,
-            "aiAnalysis": ai_response
-        }
+        try:
+            top_matches = self.classifier.find_top_matches(error_message)
+            model_output = top_matches[['Level', 'Component', 'EventTemplate', 'type']].to_dict(orient='records')
+            ai_response = self.generate_ai_response(error_message, json.dumps(model_output))
+            logger.info(f"Processed error message: {error_message[:50]}...")
+            return {
+                "errorMessage": error_message,
+                "modelClassification": model_output,
+                "aiAnalysis": ai_response
+            }
+        except Exception as e:
+            logger.error(f"Error processing error message: {str(e)}")
+            raise
 
 # Initialize the ErrorAnalysisSystem
 csv_file = os.environ.get('CSV_FILE', './combined_error.csv')
 api_key = "AIzaSyCi_rpYtGy-ms-Io7_2fz0CpjUhCIoBFlE"
 
 if not api_key:
+    logger.error("GOOGLE_API_KEY environment variable is not set")
     raise ValueError("GOOGLE_API_KEY environment variable is not set")
 
-system = ErrorAnalysisSystem(csv_file, api_key)
+try:
+    system = ErrorAnalysisSystem(csv_file, api_key)
+except Exception as e:
+    logger.error(f"Failed to initialize ErrorAnalysisSystem: {str(e)}")
+    raise
 
-@app.route('/analyze', methods=['POST'])
+@app.route('/analyze', methods=['POST', 'OPTIONS'])
 def analyze_error():
-    data = request.json
-    if 'error_message' not in data:
-        return jsonify({"error": "No error_message provided"}), 400
+    if request.method == 'OPTIONS':
+        # Handling preflight request
+        return '', 204
     
-    error_message = data['error_message']
-    result = system.process_error(error_message)
-    return jsonify(result)
+    try:
+        data = request.json
+        if 'error_message' not in data:
+            logger.warning("No error_message provided in request")
+            return jsonify({"error": "No error_message provided"}), 400
+        
+        error_message = data['error_message']
+        logger.info(f"Processing error message: {error_message[:50]}...")
+        result = system.process_error(error_message)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error processing request: {str(e)}")
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
